@@ -1,0 +1,214 @@
+#!/bin/bash
+
+MODS_FILE="mods.csv"
+MODS_DIR=$(grep '^MODS_FOLDER_PATH=' bgm.conf | cut -d'=' -f2- | tr -d "'\"")
+MODS_NAMES=$(ls $MODS_DIR)
+GAME_DIR=$(grep '^GAME_PATH=' bgm.conf | cut -d'=' -f2- | tr -d "'\"")
+GAME_LAUNCHER="$GAME_DIR/bin/bg3"
+RUNTIME="$HOME/.steam/steam/steamapps/common/SteamLinuxRuntime_soldier/pressure-vessel/bin/pressure-vessel-wrap"
+
+function list_mods {
+    # Clean the file: ignore empty lines and invisible characters
+    mapfile -t LINES < <(grep -v '^[[:space:]]*$' "$MODS_FILE" | sed 's/[^[:print:]]//g')
+
+    function draw_list {
+        clear
+        unset 'LINES[0]'
+        for i in "${!LINES[@]}"; do
+            IFS=';' read -r enable name version path <<< "${LINES[$i]}"
+            if [[ "$enable" == "true" ]]; then
+                icon="✅"
+            elif [[ "$enable" == "false" ]]; then
+                icon="❌"
+            else
+                icon="$enable"
+            fi
+            lenght=${#version}
+            spaces=$(( lenght < 8 ? 8 - lenght : 0 ))
+            padding=$(printf '%*s' "$spaces" "")
+            line_display="$icon $version$padding $name"
+            if [[ $i -eq $CURSOR ]]; then
+                printf "> %s\n" "$line_display"
+            else
+                printf "  %s\n" "$line_display"
+            fi
+        done
+        echo -e "\nUse ↑ ↓ to move, Enter to confirm, E to enable/desable and Q to quit"
+    }
+
+    CURSOR=1
+    draw_list
+
+    while true; do
+        read -rsn1 key
+        case "$key" in
+            $'\x1b') # Arrows
+                read -rsn2 key2
+                case "$key2" in
+                    '[A') (( CURSOR > 1 )) && ((CURSOR--)) ;;   # Up
+                    '[B') (( CURSOR < ${#LINES[@]} )) && ((CURSOR++)) ;; # Down
+                esac
+                ;;
+            'E'|'e') # Enable/disable
+                # Skip header
+                if (( CURSOR > 0 )); then
+                    IFS=';' read -r enable name path <<< "${LINES[$CURSOR]}"
+                    if [[ "$enable" == "true" ]]; then
+                        enable="false"
+                    else
+                        enable="true"
+                    fi
+                    LINES[$CURSOR]="$enable;$name;$path"
+                fi
+                ;;
+            '') # Enter
+                SELECTED=$CURSOR
+                echo -e "\nMoving '${LINES[$SELECTED]}'"
+                while true; do
+                    draw_list
+                    read -rsn1 move
+                    case "$move" in
+                        $'\x1b')
+                            read -rsn2 move2
+                            case "$move2" in
+                                '[A') # Up
+                                    if (( SELECTED > 1 )); then
+                                        tmp="${LINES[$SELECTED]}"
+                                        LINES[$SELECTED]="${LINES[$((SELECTED-1))]}"
+                                        LINES[$((SELECTED-1))]="$tmp"
+                                        ((SELECTED--))
+                                        CURSOR=$SELECTED
+                                    fi
+                                    ;;
+                                '[B') # Down
+                                    if (( SELECTED < ${#LINES[@]}  )); then
+                                        tmp="${LINES[$SELECTED]}"
+                                        LINES[$SELECTED]="${LINES[$((SELECTED+1))]}"
+                                        LINES[$((SELECTED+1))]="$tmp"
+                                        ((SELECTED++))
+                                        CURSOR=$SELECTED
+                                    fi
+                                    ;;
+                            esac
+                            ;;
+                        '') break ;; # Enter to confirm
+                    esac
+                done
+                ;;
+            'Q'|'q') break ;; # Quit
+        esac
+        draw_list
+    done
+
+    # Clean save
+    LINES=("enable;name;path" "${LINES[@]}")
+    printf "%s\n" "${LINES[@]}" > "$MODS_FILE"
+}
+
+
+function help_message {
+    
+    echo "deploy___Deploy the enabled mods to the game folder"
+    echo "update___Update the mods list from the mods folder"
+    echo "help_____Show this help message"
+    echo "config___Open the configuration file"
+    echo "list_____Reorder the mods list and enable/disable mods"
+}
+
+
+# Update the mods list
+function update {
+
+    IFS=$'\n'
+    for path in $MODS_NAMES; do
+        # Remove extension
+        base="${path%.*}"
+        # Clean name: remove digits, '-', '_' characters
+        clean_name=$(echo "$base" | sed 's/[0-9_-]//g')
+        # Get version: remove letters, remove extension, replace - and _ by ., trim leading/trailing .
+        version=$(echo "$base" | sed 's/[a-zA-Z]//g' | sed 's/[-_]/./g' | tr -d ' ' | sed -E 's/^\.//; s/\.$//; s/.{11}$//' | cut -c5-)
+        if ! grep -q ";$path\$" "$MODS_FILE"; then
+            echo "false;$clean_name;$version;$path" >> "$MODS_FILE"
+        fi
+    done
+    unset IFS
+
+}
+
+# Deploy mods to game
+function deploy {
+    rm deployed.csv
+    touch deployed.csv
+
+    # Extract all files list in mods.csv from bottom to top
+    while IFS=';' read -r enable name version path; do
+        if [[ "$enable" == "true" ]]; then
+            if [[ "$path" == *.zip || "$path" == *.7zip || "$path" == *.rar ]]; then
+                tmpdir=$(mktemp -d)
+                unzip -o "$MODS_DIR/$path" -d "$tmpdir" > /dev/null
+            fi
+        fi
+    done < <(tail -n +2 "$MODS_FILE" | tac)  # Skip header, then reverse line order
+
+    # Move every file from tmp to game folder
+    for file in "$tmpdir"/*; do
+        filename=$(basename "$file")
+        extension=${filename##*.}
+        if [[ "$extension" == "pak" || "$extension" == "pax" ]]; then
+            cp "$tmpdir/$filename" "$GAME_DIR/Data/$filename"
+        elif [[ "$extension" == "dll" && "$file" != *bin* ]]; then
+            cp "$tmpdir/$filename" "$GAME_DIR/bin/$filename"
+        elif [[ "$filename" != "info" && "$extension" != "readme" ]]; then
+            cp "$tmpdir/$filename" "$GAME_DIR/$filename"
+        fi
+    done
+
+    rm -rf "$tmpdir"
+}
+
+function launch_game {
+    steam steam://rungameid/1086940
+}
+
+update
+
+# Main CLI logic
+case "$1" in
+    reset)
+        echo "Not implemented yet"
+        ;;
+    launch)
+        launch_game
+        ;;
+    deploy)
+        deploy
+        ;;
+    update)
+        echo "Mods list updated from $MODS_DIR"
+        ;;
+    open)
+        case "$2" in
+            config)
+                xdg-open "bgm.conf"
+                ;;
+            mods)
+                xdg-open "$MODS_DIR"
+                ;;
+            game)
+                xdg-open "$GAME_DIR"
+                ;;
+        esac
+        ;;
+    -h)
+        help_message
+        ;;
+    help)
+        help_message
+        ;;
+    list)
+        list_mods
+        ;;
+    *)
+        help_message
+        ;;
+esac
