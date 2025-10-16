@@ -101,7 +101,7 @@ function list_mods {
     done
 
     # Clean save
-    LINES=("enable;name;path" "${LINES[@]}")
+    LINES=("enable;name;version;path" "${LINES[@]}")
     printf "%s\n" "${LINES[@]}" > "$MODS_FILE"
 }
 
